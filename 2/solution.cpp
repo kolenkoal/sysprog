@@ -82,9 +82,8 @@ make_argv(const command &cmd)
 }
 
 static pipeline_result
-run_pipeline_segment(const std::vector<command> &cmds, const command_line &line,
-    bool is_last_pipeline, bool allow_exit, int last_status, int input_fd,
-    int output_fd_override)
+run_pipeline(const std::vector<command> &cmds, const command_line &line,
+    bool is_last_pipeline, bool allow_exit, int last_status)
 {
 	pipeline_result result{};
 
@@ -98,10 +97,7 @@ run_pipeline_segment(const std::vector<command> &cmds, const command_line &line,
 		if (cmd.exe == "cd") {
 			int saved_stdout = -1;
 			int fd = -1;
-			if (output_fd_override >= 0) {
-				saved_stdout = dup(STDOUT_FILENO);
-				dup2(output_fd_override, STDOUT_FILENO);
-			} else if (is_last_pipeline && line.out_type != OUTPUT_TYPE_STDOUT) {
+			if (is_last_pipeline && line.out_type != OUTPUT_TYPE_STDOUT) {
 				fd = open_output_fd(line);
 				if (fd < 0) {
 					perror("open");
@@ -122,7 +118,7 @@ run_pipeline_segment(const std::vector<command> &cmds, const command_line &line,
 	}
 
 	std::vector<pid_t> pids;
-	int current_input = input_fd;
+	int current_input = STDIN_FILENO;
 	for (size_t i = 0; i < cmds.size(); ++i) {
 		int pipefd[2] = {-1, -1};
 		if (i + 1 < cmds.size()) {
@@ -134,13 +130,10 @@ run_pipeline_segment(const std::vector<command> &cmds, const command_line &line,
 		}
 		pid_t pid = fork();
 		if (pid == 0) {
-			if (current_input != STDIN_FILENO) {
+			if (current_input != STDIN_FILENO)
 				dup2(current_input, STDIN_FILENO);
-			}
 			if (pipefd[1] != -1) {
 				dup2(pipefd[1], STDOUT_FILENO);
-			} else if (output_fd_override >= 0) {
-				dup2(output_fd_override, STDOUT_FILENO);
 			} else if (is_last_pipeline && line.out_type != OUTPUT_TYPE_STDOUT) {
 				int fd = open_output_fd(line);
 				if (fd < 0) {
@@ -156,8 +149,6 @@ run_pipeline_segment(const std::vector<command> &cmds, const command_line &line,
 				close(pipefd[1]);
 			if (current_input != STDIN_FILENO)
 				close(current_input);
-			if (output_fd_override >= 0)
-				close(output_fd_override);
 
 			const command &cmd = cmds[i];
 			if (cmd.exe == "cd") {
@@ -203,69 +194,6 @@ run_pipeline_segment(const std::vector<command> &cmds, const command_line &line,
 	}
 	result.status = status_from_wait(st);
 	return result;
-}
-
-static pipeline_result
-run_pipeline(const std::vector<command> &cmds, const command_line &line,
-    bool is_last_pipeline, bool allow_exit, int last_status)
-{
-	const size_t chunk_limit = 200;
-	if (cmds.size() <= chunk_limit) {
-		return run_pipeline_segment(cmds, line, is_last_pipeline, allow_exit,
-		    last_status, STDIN_FILENO, -1);
-	}
-
-	pipeline_result res{};
-	size_t pos = 0;
-	int input_fd = STDIN_FILENO;
-	int status_acc = last_status;
-	while (pos < cmds.size()) {
-		size_t end = pos + chunk_limit;
-		if (end > cmds.size())
-			end = cmds.size();
-		bool last_chunk = (end == cmds.size());
-
-		char tmpl[] = "/tmp/mybashXXXXXX";
-		int tmp_fd = -1;
-		if (!last_chunk) {
-			tmp_fd = mkstemp(tmpl);
-			if (tmp_fd < 0) {
-				perror("mkstemp");
-				if (input_fd != STDIN_FILENO)
-					close(input_fd);
-				res.status = 1;
-				return res;
-			}
-		}
-
-		std::vector<command> segment(cmds.begin() + (long)pos, cmds.begin() + (long)end);
-		res = run_pipeline_segment(segment, line,
-		    is_last_pipeline && last_chunk, allow_exit, status_acc, input_fd,
-		    tmp_fd);
-		status_acc = res.status;
-		if (res.exit_shell) {
-			if (input_fd != STDIN_FILENO)
-				close(input_fd);
-			if (!last_chunk && tmp_fd != -1)
-				close(tmp_fd);
-			return res;
-		}
-
-		if (!last_chunk) {
-			if (input_fd != STDIN_FILENO)
-				close(input_fd);
-			lseek(tmp_fd, 0, SEEK_SET);
-			input_fd = tmp_fd;
-			unlink(tmpl);
-		} else {
-			if (tmp_fd != -1)
-				close(tmp_fd);
-			if (input_fd != STDIN_FILENO)
-				close(input_fd);
-		}
-		pos = end;
-	}
-	return res;
 }
 
 static void
